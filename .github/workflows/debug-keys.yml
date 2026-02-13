@@ -1,0 +1,119 @@
+name: Debug Key Search
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RouterOS version'
+        required: true
+        default: '6.49.18'
+        type: string
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Install deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y squashfs-tools --no-install-recommends
+        pip install pefile
+    - name: Download ISOs
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        wget -nv -O mikrotik18.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
+        wget -nv -O mikrotik17.iso "https://download.mikrotik.com/routeros/6.49.17/mikrotik-6.49.17.iso"
+    - name: Extract NPK
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        sudo mkdir iso17 iso18
+        sudo mount -o loop,ro mikrotik17.iso iso17/
+        sudo mount -o loop,ro mikrotik18.iso iso18/
+        sudo cp iso17/system-*.npk system17.npk 2>/dev/null || sudo cp iso17/routeros-*.npk system17.npk
+        sudo cp iso18/system-*.npk system18.npk 2>/dev/null || sudo cp iso18/routeros-*.npk system18.npk
+        sudo umount iso17/ iso18/
+    - name: Extract squashfs
+      run: |
+        python3 -c "
+import sys; sys.path.insert(0,'.')
+from npk import NovaPackage, NpkPartID
+for v,f in [('17','system17.npk'),('18','system18.npk')]:
+    npk = NovaPackage.load(f)
+    open(f'sfs{v}.sfs','wb').write(npk[NpkPartID.SQUASHFS].data)
+    print(f'v{v} squashfs extracted')
+"
+        sudo unsquashfs -d sq17 sfs17.sfs
+        sudo unsquashfs -d sq18 sfs18.sfs
+    - name: Analyze keys
+      run: |
+        python3 << 'EOF'
+        import os
+        LK = bytes.fromhex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
+        NK = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
+
+        def scan(root, label):
+            print(f"\n=== {label} ===")
+            for dp, _, fs in sorted(os.walk(root)):
+                for fn in sorted(fs):
+                    fp = os.path.join(dp, fn)
+                    try:
+                        d = open(fp, 'rb').read()
+                    except: continue
+                    hl = LK in d
+                    hn = NK in d
+                    if hl or hn:
+                        tags = []
+                        if hl: tags.append("LICENSE")
+                        if hn: tags.append("NPK_SIGN")
+                        print(f"  {fp}: {', '.join(tags)}")
+
+        scan("sq17", "v6.49.17")
+        scan("sq18", "v6.49.18")
+
+        print("\n=== DETAIL PER BINARY ===")
+        for b in ['loader','keyman','fileman','sys2','installer']:
+            p17 = f"sq17/nova/bin/{b}"
+            p18 = f"sq18/nova/bin/{b}"
+            e17 = os.path.exists(p17)
+            e18 = os.path.exists(p18)
+            if not e17 and not e18: continue
+            if e17 and not e18:
+                print(f"\n{b}: v17 EXISTS, v18 MISSING!")
+                continue
+            if not e17 and e18:
+                print(f"\n{b}: v17 MISSING, v18 NEW!")
+                continue
+            d17 = open(p17,'rb').read()
+            d18 = open(p18,'rb').read()
+            l17 = LK in d17
+            l18 = LK in d18
+            print(f"\n{b}: size v17={len(d17)} v18={len(d18)}")
+            print(f"  LICENSE: v17={'Y' if l17 else 'N'} v18={'Y' if l18 else 'N'} {'CHANGED!' if l17!=l18 else ''}")
+            print(f"  NPK_SIGN: v17={'Y' if NK in d17 else 'N'} v18={'Y' if NK in d18 else 'N'}")
+            if l17 and not l18:
+                idx = d17.index(LK)
+                print(f"  Key was at offset {hex(idx)} in v17")
+                for cl in [16,8,4]:
+                    ctx = d17[max(0,idx-cl):idx]
+                    if ctx in d18:
+                        ni = d18.index(ctx)+len(ctx)
+                        nk = d18[ni:ni+32]
+                        print(f"  POTENTIAL NEW KEY (ctx={cl}): {nk.hex().upper()}")
+                        break
+                else:
+                    print(f"  Could not locate via context matching")
+
+        print("\n=== FILES IN v17 but not v18 ===")
+        f17 = set()
+        for dp,_,fs in os.walk("sq17"):
+            for fn in fs: f17.add(os.path.join(dp,fn).replace("sq17/",""))
+        f18 = set()
+        for dp,_,fs in os.walk("sq18"):
+            for fn in fs: f18.add(os.path.join(dp,fn).replace("sq18/",""))
+        for f in sorted(f17-f18): print(f"  REMOVED: {f}")
+        for f in sorted(f18-f17): print(f"  ADDED: {f}")
+        EOF
