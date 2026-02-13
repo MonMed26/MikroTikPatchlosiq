@@ -2,6 +2,25 @@ name: Patch v6
 
 on:
   workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - long-term
+      version:
+        description: 'Versi spesifik (contoh: 6.49.17), kosongkan untuk latest'
+        required: false
+        default: ''
+        type: string
+      release:
+        description: 'Buat GitHub Release'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -36,21 +55,26 @@ jobs:
       id: get_latest
       run: |
         echo $(uname -a)
-        NEWEST=$(curl -s https://upgrade.mikrotik.com/routeros/NEWEST6.stable)
-        LATEST_VERSION=$(echo "$NEWEST" | cut -d' ' -f1)
-        BUILD_TIME=$(echo "$NEWEST" | cut -d' ' -f2)
-        echo Latest Version: $LATEST_VERSION
-        echo Build Time: $BUILD_TIME
-        _LATEST_VERSION=$(cat latest6.txt | cut -d ' ' -f1)
-        if [ "$_LATEST_VERSION" == "$LATEST_VERSION" ]; then
-          echo "No new version found"
-          echo "has_new_version=false" >> $GITHUB_OUTPUT
-          exit 0
+        CHANNEL="${{ github.event.inputs.channel }}"
+        INPUT_VERSION="${{ github.event.inputs.version }}"
+        
+        if [ -n "$INPUT_VERSION" ]; then
+          # Versi spesifik dipilih
+          LATEST_VERSION="$INPUT_VERSION"
+          echo "Using specified version: $LATEST_VERSION"
+        else
+          # Ambil versi terbaru dari channel yang dipilih
+          NEWEST=$(curl -s https://upgrade.mikrotik.com/routeros/NEWEST6.${CHANNEL})
+          LATEST_VERSION=$(echo "$NEWEST" | cut -d' ' -f1)
+          BUILD_TIME=$(echo "$NEWEST" | cut -d' ' -f2)
+          echo "Latest $CHANNEL version: $LATEST_VERSION"
+          echo "Build Time: $BUILD_TIME"
+          echo "NEWEST=${NEWEST}" >> $GITHUB_ENV
         fi
+        
         echo "has_new_version=true" >> $GITHUB_OUTPUT
         curl -s -o CHANGELOG https://upgrade.mikrotik.com/routeros/$LATEST_VERSION/CHANGELOG
         cat CHANGELOG
-        echo "NEWEST=${NEWEST}" >> $GITHUB_ENV
         echo "LATEST_VERSION=${LATEST_VERSION}" >> $GITHUB_ENV
 
     - name: Cache mikrotik-${{ env.LATEST_VERSION }}.iso
@@ -203,7 +227,7 @@ jobs:
         sudo rm chr-$LATEST_VERSION-patched.img
 
     - name: Update latest version
-      if: steps.get_latest.outputs.has_new_version == 'true'
+      if: steps.get_latest.outputs.has_new_version == 'true' && github.event.inputs.release == 'true'
       run: |
         echo $NEWEST > latest6.txt
         git config user.name "github-actions[bot]"
@@ -213,7 +237,7 @@ jobs:
         git push
 
     - name: Create Release tag ${{ env.LATEST_VERSION }}
-      if: steps.get_latest.outputs.has_new_version == 'true'
+      if: steps.get_latest.outputs.has_new_version == 'true' && github.event.inputs.release == 'true'
       uses: softprops/action-gh-release@v2
       with:
         name: "RouterOS ${{ env.LATEST_VERSION }}"
@@ -221,6 +245,18 @@ jobs:
         tag_name: ${{ env.LATEST_VERSION }}
         make_latest: true
         files: |
+          mikrotik-${{ env.LATEST_VERSION }}-patched.iso
+          install-image-${{ env.LATEST_VERSION }}-patched.*.zip
+          chr-${{ env.LATEST_VERSION }}-patched.*.zip
+          routeros-x86-${{ env.LATEST_VERSION }}-patched.npk
+          all_packages-x86-${{ env.LATEST_VERSION }}-patched.zip
+
+    - name: Upload as Artifact (tanpa Release)
+      if: steps.get_latest.outputs.has_new_version == 'true' && github.event.inputs.release != 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: mikrotik-${{ env.LATEST_VERSION }}-patched
+        path: |
           mikrotik-${{ env.LATEST_VERSION }}-patched.iso
           install-image-${{ env.LATEST_VERSION }}-patched.*.zip
           chr-${{ env.LATEST_VERSION }}-patched.*.zip
