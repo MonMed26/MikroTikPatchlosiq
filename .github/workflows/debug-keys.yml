@@ -1,119 +1,213 @@
-name: Debug Key Search
-
+name: Debug Key Search Fixed
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'RouterOS version'
+        description: RouterOS version to analyze
         required: true
         default: '6.49.18'
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   debug:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
-    - name: Install deps
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y squashfs-tools --no-install-recommends
-        pip install pefile
-    - name: Download ISOs
-      run: |
-        VERSION="${{ github.event.inputs.version }}"
-        wget -nv -O mikrotik18.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
-        wget -nv -O mikrotik17.iso "https://download.mikrotik.com/routeros/6.49.17/mikrotik-6.49.17.iso"
-    - name: Extract NPK
-      run: |
-        VERSION="${{ github.event.inputs.version }}"
-        sudo mkdir iso17 iso18
-        sudo mount -o loop,ro mikrotik17.iso iso17/
-        sudo mount -o loop,ro mikrotik18.iso iso18/
-        sudo cp iso17/system-*.npk system17.npk 2>/dev/null || sudo cp iso17/routeros-*.npk system17.npk
-        sudo cp iso18/system-*.npk system18.npk 2>/dev/null || sudo cp iso18/routeros-*.npk system18.npk
-        sudo umount iso17/ iso18/
-    - name: Extract squashfs
-      run: |
-        python3 -c "
-import sys; sys.path.insert(0,'.')
-from npk import NovaPackage, NpkPartID
-for v,f in [('17','system17.npk'),('18','system18.npk')]:
-    npk = NovaPackage.load(f)
-    open(f'sfs{v}.sfs','wb').write(npk[NpkPartID.SQUASHFS].data)
-    print(f'v{v} squashfs extracted')
-"
-        sudo unsquashfs -d sq17 sfs17.sfs
-        sudo unsquashfs -d sq18 sfs18.sfs
-    - name: Analyze keys
-      run: |
-        python3 << 'EOF'
-        import os
-        LK = bytes.fromhex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
-        NK = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
+      - name: Checkout
+        uses: actions/checkout@v4
 
-        def scan(root, label):
-            print(f"\n=== {label} ===")
-            for dp, _, fs in sorted(os.walk(root)):
-                for fn in sorted(fs):
-                    fp = os.path.join(dp, fn)
-                    try:
-                        d = open(fp, 'rb').read()
-                    except: continue
-                    hl = LK in d
-                    hn = NK in d
-                    if hl or hn:
-                        tags = []
-                        if hl: tags.append("LICENSE")
-                        if hn: tags.append("NPK_SIGN")
-                        print(f"  {fp}: {', '.join(tags)}")
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
-        scan("sq17", "v6.49.17")
-        scan("sq18", "v6.49.18")
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools p7zip-full
+          
+          # Install library python yang dibutuhkan (pefile opsional tapi saya sertakan jika Anda butuh nanti)
+          pip install pefile
+          
+          # PENTING: Download library npk.py karena tidak ada di pip standar
+          # Menggunakan implementasi umum dari pborzenkov
+          wget -q -O npk.py https://raw.githubusercontent.com/pborzenkov/npk/master/npk.py
 
-        print("\n=== DETAIL PER BINARY ===")
-        for b in ['loader','keyman','fileman','sys2','installer']:
-            p17 = f"sq17/nova/bin/{b}"
-            p18 = f"sq18/nova/bin/{b}"
-            e17 = os.path.exists(p17)
-            e18 = os.path.exists(p18)
-            if not e17 and not e18: continue
-            if e17 and not e18:
-                print(f"\n{b}: v17 EXISTS, v18 MISSING!")
-                continue
-            if not e17 and e18:
-                print(f"\n{b}: v17 MISSING, v18 NEW!")
-                continue
-            d17 = open(p17,'rb').read()
-            d18 = open(p18,'rb').read()
-            l17 = LK in d17
-            l18 = LK in d18
-            print(f"\n{b}: size v17={len(d17)} v18={len(d18)}")
-            print(f"  LICENSE: v17={'Y' if l17 else 'N'} v18={'Y' if l18 else 'N'} {'CHANGED!' if l17!=l18 else ''}")
-            print(f"  NPK_SIGN: v17={'Y' if NK in d17 else 'N'} v18={'Y' if NK in d18 else 'N'}")
-            if l17 and not l18:
-                idx = d17.index(LK)
-                print(f"  Key was at offset {hex(idx)} in v17")
-                for cl in [16,8,4]:
-                    ctx = d17[max(0,idx-cl):idx]
-                    if ctx in d18:
-                        ni = d18.index(ctx)+len(ctx)
-                        nk = d18[ni:ni+32]
-                        print(f"  POTENTIAL NEW KEY (ctx={cl}): {nk.hex().upper()}")
-                        break
-                else:
-                    print(f"  Could not locate via context matching")
+      - name: Download Firmware Versions
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          echo "Downloading v6.49.17 and v$VERSION..."
+          
+          wget -nv -O mikrotik18.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
+          wget -nv -O mikrotik17.iso "https://download.mikrotik.com/routeros/6.49.17/mikrotik-6.49.17.iso"
 
-        print("\n=== FILES IN v17 but not v18 ===")
-        f17 = set()
-        for dp,_,fs in os.walk("sq17"):
-            for fn in fs: f17.add(os.path.join(dp,fn).replace("sq17/",""))
-        f18 = set()
-        for dp,_,fs in os.walk("sq18"):
-            for fn in fs: f18.add(os.path.join(dp,fn).replace("sq18/",""))
-        for f in sorted(f17-f18): print(f"  REMOVED: {f}")
-        for f in sorted(f18-f17): print(f"  ADDED: {f}")
-        EOF
+      - name: Extract ISOs (Safe Method)
+        run: |
+          # Menggunakan 7z untuk ekstrak ISO (lebih aman daripada mount loop di CI)
+          # Mencari file system-*.npk atau routeros-*.npk
+          
+          echo "Extracting v17..."
+          7z x mikrotik17.iso -oiso17 -r > /dev/null
+          find iso17 -name "system-*.npk" -o -name "routeros-*.npk" | head -n 1 | xargs -I {} cp {} system17.npk
+          
+          echo "Extracting v18..."
+          VERSION="${{ github.event.inputs.version }}"
+          7z x mikrotik18.iso -oiso18 -r > /dev/null
+          find iso18 -name "system-*.npk" -o -name "routeros-*.npk" | head -n 1 | xargs -I {} cp {} system18.npk
+
+      - name: Extract NPK and SquashFS
+        run: |
+          # Script Python untuk ekstrak SquashFS dari dalam NPK
+          python3 -c "
+          import sys, os
+          sys.path.insert(0,'.')
+          try:
+              from npk import NovaPackage, NpkPartID
+          except ImportError:
+              print('Error: npk module not found. Download step failed?')
+              sys.exit(1)
+
+          def extract_sfs(npk_file, out_sfs):
+              if not os.path.exists(npk_file):
+                  print(f'Skipping {npk_file} (not found)')
+                  return
+              print(f'Processing {npk_file}...')
+              try:
+                  pkg = NovaPackage.load(npk_file)
+                  # Mencari partisi SquashFS
+                  for part in pkg:
+                      if part.id == NpkPartID.SQUASHFS:
+                          with open(out_sfs, 'wb') as f:
+                              f.write(part.data)
+                          print(f'Saved {out_sfs}')
+                          return
+                  print('SquashFS partition not found in NPK')
+              except Exception as e:
+                  print(f'Error reading NPK: {e}')
+
+          extract_sfs('system17.npk', 'sfs17.sfs')
+          extract_sfs('system18.npk', 'sfs18.sfs')
+          "
+
+          # Unsquash filesystem
+          if [ -f sfs17.sfs ]; then unsquashfs -d sq17 sfs17.sfs; else echo "sfs17 missing"; fi
+          if [ -f sfs18.sfs ]; then unsquashfs -d sq18 sfs18.sfs; else echo "sfs18 missing"; fi
+
+      - name: Analyze Keys and Compare
+        run: |
+          # Menjalankan logika pencarian key Anda
+          python3 << 'PYEOF'
+          import os
+          import sys
+
+          # Konfigurasi Key
+          OLD_LICENSE_KEY = bytes.fromhex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
+          OLD_NPK_KEY = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
+
+          def search_keys(root_dir, label):
+              print(f"\n=== {label} ===")
+              if not os.path.exists(root_dir):
+                  print(f"Directory {root_dir} does not exist.")
+                  return
+
+              for dirpath, _, files in sorted(os.walk(root_dir)):
+                  for fname in sorted(files):
+                      fpath = os.path.join(dirpath, fname)
+                      try:
+                          with open(fpath, 'rb') as f:
+                              data = f.read()
+                      except:
+                          continue
+                      
+                      relpath = fpath.replace(root_dir, '')
+                      has_lic = OLD_LICENSE_KEY in data
+                      has_npk = OLD_NPK_KEY in data
+                      
+                      if has_lic or has_npk:
+                          keys = []
+                          if has_lic: keys.append("LICENSE_KEY(8E10..)")
+                          if has_npk: keys.append("NPK_SIGN_KEY(C293..)")
+                          print(f"  {relpath}: {', '.join(keys)}")
+
+          # Jalankan pencarian global
+          search_keys("sq17", "v6.49.17 - Files containing old keys")
+          search_keys("sq18", "v${{ github.event.inputs.version }} - Files containing old keys")
+
+          print("\n===============================================")
+          print("=== BINARY DETAIL COMPARISON ===")
+          print("===============================================")
+
+          binaries_to_check = ['loader', 'keyman', 'fileman', 'sys2', 'installer', 'init']
+          
+          for bname in binaries_to_check:
+              # Cek beberapa kemungkinan path (kadang di /bin, kadang di /sbin atau root)
+              paths = [
+                  f"nova/bin/{bname}",
+                  f"bin/{bname}",
+                  f"sbin/{bname}"
+              ]
+              
+              p17 = None
+              p18 = None
+              
+              # Temukan path yang valid di v17
+              for p in paths:
+                  full_p = os.path.join("sq17", p)
+                  if os.path.exists(full_p):
+                      p17 = full_p
+                      break
+              
+              # Temukan path yang valid di v18
+              for p in paths:
+                  full_p = os.path.join("sq18", p)
+                  if os.path.exists(full_p):
+                      p18 = full_p
+                      break
+
+              if not p17 and not p18:
+                  continue
+
+              print(f"\nBINARY: {bname}")
+              
+              if p17 and not p18:
+                  print(f"  Result: EXISTS in v17 but MISSING in v18")
+                  continue
+              if not p17 and p18:
+                  print(f"  Result: NEW in v18")
+                  continue
+
+              # Jika file ada di keduanya, lakukan deep compare
+              try:
+                  d17 = open(p17, 'rb').read()
+                  d18 = open(p18, 'rb').read()
+              except Exception as e:
+                  print(f"  Error reading files: {e}")
+                  continue
+
+              lic17 = OLD_LICENSE_KEY in d17
+              lic18 = OLD_LICENSE_KEY in d18
+              npk17 = OLD_NPK_KEY in d17
+              npk18 = OLD_NPK_KEY in d18
+
+              print(f"  Size: v17={len(d17)} v18={len(d18)} (diff={len(d18)-len(d17)})")
+              print(f"  LICENSE_KEY:  v17={'YES' if lic17 else 'NO'}  v18={'YES' if lic18 else 'NO'}  {'[CHANGED/REMOVED]' if lic17 != lic18 else ''}")
+              print(f"  NPK_SIGN_KEY: v17={'YES' if npk17 else 'NO'}  v18={'YES' if npk18 else 'NO'}  {'[CHANGED/REMOVED]' if npk17 != npk18 else ''}")
+
+              # Logika deteksi pergeseran/penggantian key
+              if lic17 and not lic18:
+                  print("  -> DETECTING KEY CHANGE...")
+                  idx17 = d17.index(OLD_LICENSE_KEY)
+                  # Ambil 16 byte sebelum key sebagai 'signature' lokasi
+                  ctx_before = d17[max(0, idx17-16):idx17]
+                  
+                  if ctx_before in d18:
+                      new_idx = d18.index(ctx_before) + len(ctx_before)
+                      potential_new_key = d18[new_idx:new_idx+32]
+                      print(f"     [!] FOUND POTENTIAL NEW KEY: {potential_new_key.hex().upper()}")
+                      print(f"     Match based on code context at offset {hex(new_idx)}")
+                  else:
+                      print("     Context bytes changed too much, cannot auto-locate replacement.")
+
+          PYEOF
