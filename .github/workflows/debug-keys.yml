@@ -33,7 +33,7 @@ jobs:
           
           # PENTING: Download library npk.py karena tidak ada di pip standar
           # Menggunakan implementasi umum dari pborzenkov
-          wget -q -O npk.py https://raw.githubusercontent.com/pborzenkov/npk/master/npk.py
+          wget -q -O npk.py https://raw.githubusercontent.com/MonMed26/MikroTikPatchlosiq/refs/heads/main/npk.py
 
       - name: Download Firmware Versions
         run: |
