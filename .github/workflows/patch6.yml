@@ -14,7 +14,7 @@ on:
       version:
         description: 'Versi spesifik (contoh: 6.49.17), kosongkan untuk latest'
         required: false
-        default: '6.49.18'
+        default: ''
         type: string
       release:
         description: 'Buat GitHub Release'
@@ -61,6 +61,8 @@ jobs:
         if [ -n "$INPUT_VERSION" ]; then
           # Versi spesifik dipilih
           LATEST_VERSION="$INPUT_VERSION"
+          BUILD_TIME=$(date +'%s')
+          NEWEST="$LATEST_VERSION $BUILD_TIME"
           echo "Using specified version: $LATEST_VERSION"
         else
           # Ambil versi terbaru dari channel yang dipilih
@@ -69,8 +71,8 @@ jobs:
           BUILD_TIME=$(echo "$NEWEST" | cut -d' ' -f2)
           echo "Latest $CHANNEL version: $LATEST_VERSION"
           echo "Build Time: $BUILD_TIME"
-          echo "NEWEST=${NEWEST}" >> $GITHUB_ENV
         fi
+        echo "NEWEST=${NEWEST}" >> $GITHUB_ENV
         
         echo "has_new_version=true" >> $GITHUB_OUTPUT
         curl -s -o CHANGELOG https://upgrade.mikrotik.com/routeros/$LATEST_VERSION/CHANGELOG
@@ -233,8 +235,7 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git add latest6.txt
-        git commit -m "Update latest version"
-        git push
+        git diff --cached --quiet && echo "No changes to commit" || (git commit -m "Update latest version to $LATEST_VERSION" && git push)
 
     - name: Create Release tag ${{ env.LATEST_VERSION }}
       if: steps.get_latest.outputs.has_new_version == 'true' && github.event.inputs.release == 'true'
