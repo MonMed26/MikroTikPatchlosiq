@@ -1,213 +1,262 @@
-name: Debug Key Search Fixed
+name: Extract Binaries for Analysis
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: RouterOS version to analyze
+        description: 'RouterOS version to compare against v6.49.17'
         required: true
         default: '6.49.18'
         type: string
 
-permissions:
-  contents: read
-
 jobs:
-  debug:
+  extract:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y squashfs-tools p7zip-full radare2 --no-install-recommends
+        pip install pefile
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y squashfs-tools p7zip-full
-          
-          # Install library python yang dibutuhkan (pefile opsional tapi saya sertakan jika Anda butuh nanti)
-          pip install pefile
-          
-          # PENTING: Download library npk.py karena tidak ada di pip standar
-          # Menggunakan implementasi umum dari pborzenkov
-          wget -q -O npk.py https://raw.githubusercontent.com/MonMed26/MikroTikPatchlosiq/refs/heads/main/npk.py
+    - name: Download ISOs
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        echo "Downloading v6.49.17..."
+        wget -nv -O mikrotik17.iso "https://download.mikrotik.com/routeros/6.49.17/mikrotik-6.49.17.iso"
+        echo "Downloading v$VERSION..."
+        wget -nv -O mikrotik18.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
 
-      - name: Download Firmware Versions
-        run: |
-          VERSION="${{ github.event.inputs.version }}"
-          echo "Downloading v6.49.17 and v$VERSION..."
-          
-          wget -nv -O mikrotik18.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
-          wget -nv -O mikrotik17.iso "https://download.mikrotik.com/routeros/6.49.17/mikrotik-6.49.17.iso"
+    - name: Extract NPK and Squashfs
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
 
-      - name: Extract ISOs (Safe Method)
-        run: |
-          # Menggunakan 7z untuk ekstrak ISO (lebih aman daripada mount loop di CI)
-          # Mencari file system-*.npk atau routeros-*.npk
-          
-          echo "Extracting v17..."
-          7z x mikrotik17.iso -oiso17 -r > /dev/null
-          find iso17 -name "system-*.npk" -o -name "routeros-*.npk" | head -n 1 | xargs -I {} cp {} system17.npk
-          
-          echo "Extracting v18..."
-          VERSION="${{ github.event.inputs.version }}"
-          7z x mikrotik18.iso -oiso18 -r > /dev/null
-          find iso18 -name "system-*.npk" -o -name "routeros-*.npk" | head -n 1 | xargs -I {} cp {} system18.npk
+        # Extract v17
+        7z x mikrotik17.iso -oiso17 -r > /dev/null
+        find iso17 -name "system-*.npk" -o -name "routeros-*.npk" | head -n 1 | xargs -I {} cp {} system17.npk
 
-      - name: Extract NPK and SquashFS
-        run: |
-          # Script Python untuk ekstrak SquashFS dari dalam NPK
-          python3 -c "
-          import sys, os
-          sys.path.insert(0,'.')
-          try:
-              from npk import NovaPackage, NpkPartID
-          except ImportError:
-              print('Error: npk module not found. Download step failed?')
-              sys.exit(1)
+        # Extract v18
+        7z x mikrotik18.iso -oiso18 -r > /dev/null
+        find iso18 -name "system-*.npk" -o -name "routeros-*.npk" | head -n 1 | xargs -I {} cp {} system18.npk
 
-          def extract_sfs(npk_file, out_sfs):
-              if not os.path.exists(npk_file):
-                  print(f'Skipping {npk_file} (not found)')
-                  return
-              print(f'Processing {npk_file}...')
-              try:
-                  pkg = NovaPackage.load(npk_file)
-                  # Mencari partisi SquashFS
-                  for part in pkg:
-                      if part.id == NpkPartID.SQUASHFS:
-                          with open(out_sfs, 'wb') as f:
-                              f.write(part.data)
-                          print(f'Saved {out_sfs}')
-                          return
-                  print('SquashFS partition not found in NPK')
-              except Exception as e:
-                  print(f'Error reading NPK: {e}')
+        # Extract squashfs from NPK
+        python3 -c "
+        import sys; sys.path.insert(0,'.')
+        from npk import NovaPackage, NpkPartID
+        for v,f in [('17','system17.npk'),('18','system18.npk')]:
+            pkg = NovaPackage.load(f)
+            for part in pkg:
+                if part.id == NpkPartID.SQUASHFS:
+                    open(f'sfs{v}.sfs','wb').write(part.data)
+                    print(f'v{v} squashfs: {len(part.data)} bytes')
+        "
 
-          extract_sfs('system17.npk', 'sfs17.sfs')
-          extract_sfs('system18.npk', 'sfs18.sfs')
-          "
+        # Unsquash
+        unsquashfs -d sq17 sfs17.sfs
+        unsquashfs -d sq18 sfs18.sfs
 
-          # Unsquash filesystem
-          if [ -f sfs17.sfs ]; then unsquashfs -d sq17 sfs17.sfs; else echo "sfs17 missing"; fi
-          if [ -f sfs18.sfs ]; then unsquashfs -d sq18 sfs18.sfs; else echo "sfs18 missing"; fi
+    - name: Prepare binaries for download
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        mkdir -p artifacts/v6.49.17 artifacts/v$VERSION artifacts/analysis
 
-      - name: Analyze Keys and Compare
-        run: |
-          # Menjalankan logika pencarian key Anda
-          python3 << 'PYEOF'
-          import os
-          import sys
+        # Copy key binaries
+        for bin in loader keyman fileman sys2 installer; do
+          if [ -f "sq17/nova/bin/$bin" ]; then
+            cp "sq17/nova/bin/$bin" "artifacts/v6.49.17/$bin"
+          fi
+          if [ -f "sq18/nova/bin/$bin" ]; then
+            cp "sq18/nova/bin/$bin" "artifacts/v$VERSION/$bin"
+          fi
+        done
 
-          # Konfigurasi Key
-          OLD_LICENSE_KEY = bytes.fromhex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
-          OLD_NPK_KEY = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
+        echo "=== v6.49.17 binaries ==="
+        ls -la artifacts/v6.49.17/
+        echo ""
+        echo "=== v$VERSION binaries ==="
+        ls -la artifacts/v$VERSION/
 
-          def search_keys(root_dir, label):
-              print(f"\n=== {label} ===")
-              if not os.path.exists(root_dir):
-                  print(f"Directory {root_dir} does not exist.")
-                  return
+    - name: Deep analysis
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
 
-              for dirpath, _, files in sorted(os.walk(root_dir)):
-                  for fname in sorted(files):
-                      fpath = os.path.join(dirpath, fname)
-                      try:
-                          with open(fpath, 'rb') as f:
-                              data = f.read()
-                      except:
-                          continue
-                      
-                      relpath = fpath.replace(root_dir, '')
-                      has_lic = OLD_LICENSE_KEY in data
-                      has_npk = OLD_NPK_KEY in data
-                      
-                      if has_lic or has_npk:
-                          keys = []
-                          if has_lic: keys.append("LICENSE_KEY(8E10..)")
-                          if has_npk: keys.append("NPK_SIGN_KEY(C293..)")
-                          print(f"  {relpath}: {', '.join(keys)}")
+        echo "============================================" > artifacts/analysis/report.txt
+        echo "  Binary Analysis Report" >> artifacts/analysis/report.txt
+        echo "  v6.49.17 vs v$VERSION" >> artifacts/analysis/report.txt
+        echo "============================================" >> artifacts/analysis/report.txt
 
-          # Jalankan pencarian global
-          search_keys("sq17", "v6.49.17 - Files containing old keys")
-          search_keys("sq18", "v${{ github.event.inputs.version }} - Files containing old keys")
+        for bin in loader keyman; do
+          f17="artifacts/v6.49.17/$bin"
+          f18="artifacts/v$VERSION/$bin"
 
-          print("\n===============================================")
-          print("=== BINARY DETAIL COMPARISON ===")
-          print("===============================================")
+          if [ ! -f "$f17" ] || [ ! -f "$f18" ]; then
+            echo "$bin: Missing in one or both versions" >> artifacts/analysis/report.txt
+            continue
+          fi
 
-          binaries_to_check = ['loader', 'keyman', 'fileman', 'sys2', 'installer', 'init']
-          
-          for bname in binaries_to_check:
-              # Cek beberapa kemungkinan path (kadang di /bin, kadang di /sbin atau root)
-              paths = [
-                  f"nova/bin/{bname}",
-                  f"bin/{bname}",
-                  f"sbin/{bname}"
-              ]
-              
-              p17 = None
-              p18 = None
-              
-              # Temukan path yang valid di v17
-              for p in paths:
-                  full_p = os.path.join("sq17", p)
-                  if os.path.exists(full_p):
-                      p17 = full_p
-                      break
-              
-              # Temukan path yang valid di v18
-              for p in paths:
-                  full_p = os.path.join("sq18", p)
-                  if os.path.exists(full_p):
-                      p18 = full_p
-                      break
+          echo "" >> artifacts/analysis/report.txt
+          echo "============================================" >> artifacts/analysis/report.txt
+          echo "  $bin" >> artifacts/analysis/report.txt
+          echo "============================================" >> artifacts/analysis/report.txt
 
-              if not p17 and not p18:
-                  continue
+          # File info
+          echo "" >> artifacts/analysis/report.txt
+          echo "--- File Info ---" >> artifacts/analysis/report.txt
+          echo "v17: $(wc -c < $f17) bytes" >> artifacts/analysis/report.txt
+          echo "v18: $(wc -c < $f18) bytes" >> artifacts/analysis/report.txt
+          echo "v17 md5: $(md5sum $f17 | cut -d' ' -f1)" >> artifacts/analysis/report.txt
+          echo "v18 md5: $(md5sum $f18 | cut -d' ' -f1)" >> artifacts/analysis/report.txt
 
-              print(f"\nBINARY: {bname}")
-              
-              if p17 and not p18:
-                  print(f"  Result: EXISTS in v17 but MISSING in v18")
-                  continue
-              if not p17 and p18:
-                  print(f"  Result: NEW in v18")
-                  continue
+          # Strings comparison
+          echo "" >> artifacts/analysis/report.txt
+          echo "--- Strings unique to v17 ---" >> artifacts/analysis/report.txt
+          strings "$f17" | sort -u > "/tmp/${bin}_str17.txt"
+          strings "$f18" | sort -u > "/tmp/${bin}_str18.txt"
+          diff "/tmp/${bin}_str17.txt" "/tmp/${bin}_str18.txt" | grep "^<" | head -30 >> artifacts/analysis/report.txt
 
-              # Jika file ada di keduanya, lakukan deep compare
-              try:
-                  d17 = open(p17, 'rb').read()
-                  d18 = open(p18, 'rb').read()
-              except Exception as e:
-                  print(f"  Error reading files: {e}")
-                  continue
+          echo "" >> artifacts/analysis/report.txt
+          echo "--- Strings unique to v$VERSION ---" >> artifacts/analysis/report.txt
+          diff "/tmp/${bin}_str17.txt" "/tmp/${bin}_str18.txt" | grep "^>" | head -30 >> artifacts/analysis/report.txt
 
-              lic17 = OLD_LICENSE_KEY in d17
-              lic18 = OLD_LICENSE_KEY in d18
-              npk17 = OLD_NPK_KEY in d17
-              npk18 = OLD_NPK_KEY in d18
+          # Save full string lists
+          cp "/tmp/${bin}_str17.txt" "artifacts/analysis/${bin}_strings_v17.txt"
+          cp "/tmp/${bin}_str18.txt" "artifacts/analysis/${bin}_strings_v18.txt"
 
-              print(f"  Size: v17={len(d17)} v18={len(d18)} (diff={len(d18)-len(d17)})")
-              print(f"  LICENSE_KEY:  v17={'YES' if lic17 else 'NO'}  v18={'YES' if lic18 else 'NO'}  {'[CHANGED/REMOVED]' if lic17 != lic18 else ''}")
-              print(f"  NPK_SIGN_KEY: v17={'YES' if npk17 else 'NO'}  v18={'YES' if npk18 else 'NO'}  {'[CHANGED/REMOVED]' if npk17 != npk18 else ''}")
+          # Binary diff summary using radare2
+          echo "" >> artifacts/analysis/report.txt
+          echo "--- Binary Diff (radiff2) ---" >> artifacts/analysis/report.txt
+          radiff2 -s "$f17" "$f18" 2>/dev/null | head -50 >> artifacts/analysis/report.txt || echo "radiff2 failed" >> artifacts/analysis/report.txt
+        done
 
-              # Logika deteksi pergeseran/penggantian key
-              if lic17 and not lic18:
-                  print("  -> DETECTING KEY CHANGE...")
-                  idx17 = d17.index(OLD_LICENSE_KEY)
-                  # Ambil 16 byte sebelum key sebagai 'signature' lokasi
-                  ctx_before = d17[max(0, idx17-16):idx17]
-                  
-                  if ctx_before in d18:
-                      new_idx = d18.index(ctx_before) + len(ctx_before)
-                      potential_new_key = d18[new_idx:new_idx+32]
-                      print(f"     [!] FOUND POTENTIAL NEW KEY: {potential_new_key.hex().upper()}")
-                      print(f"     Match based on code context at offset {hex(new_idx)}")
-                  else:
-                      print("     Context bytes changed too much, cannot auto-locate replacement.")
+        # Python deep analysis
+        python3 << 'PYEOF'
+        import os
 
-          PYEOF
+        LK = bytes.fromhex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
+
+        version = os.environ.get("VERSION", "6.49.18")
+
+        with open("artifacts/analysis/key_analysis.txt", "w") as report:
+            for bname in ['loader', 'keyman']:
+                f17 = f"artifacts/v6.49.17/{bname}"
+                f18 = f"artifacts/v{version}/{bname}"
+
+                if not os.path.exists(f17) or not os.path.exists(f18):
+                    continue
+
+                d17 = open(f17, 'rb').read()
+                d18 = open(f18, 'rb').read()
+
+                report.write(f"\n{'='*60}\n")
+                report.write(f"  {bname} - Key Location Analysis\n")
+                report.write(f"{'='*60}\n\n")
+
+                if LK in d17:
+                    idx = d17.index(LK)
+                    report.write(f"OLD KEY found in v17 at offset {hex(idx)}\n")
+                    report.write(f"Hex dump around key in v17:\n")
+
+                    # Show 64 bytes before and after
+                    start = max(0, idx - 64)
+                    end = min(len(d17), idx + 32 + 64)
+                    for off in range(start, end, 16):
+                        chunk = d17[off:off+16]
+                        hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                        marker = " <<< KEY START" if off == (idx // 16) * 16 else ""
+                        report.write(f"  v17 {hex(off)}: {hex_str}  |{ascii_str}|{marker}\n")
+
+                    report.write(f"\nSame region in v18:\n")
+                    # Try to find the same region in v18 with multiple context sizes
+                    for ctx_len in [64, 48, 32, 16, 8, 4]:
+                        ctx = d17[max(0, idx-ctx_len):idx]
+                        if len(ctx) < ctx_len:
+                            continue
+
+                        pos = 0
+                        while True:
+                            found = d18.find(ctx, pos)
+                            if found == -1:
+                                break
+                            key_pos = found + len(ctx)
+                            potential = d18[key_pos:key_pos+32]
+
+                            report.write(f"\n  Context match ({ctx_len} bytes before): v18 offset {hex(found)}\n")
+                            report.write(f"  Potential replacement (32 bytes): {potential.hex().upper()}\n")
+
+                            # Hex dump around this location in v18
+                            start18 = max(0, key_pos - 32)
+                            end18 = min(len(d18), key_pos + 64)
+                            for off in range(start18, end18, 16):
+                                chunk = d18[off:off+16]
+                                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                                marker = " <<< POTENTIAL KEY" if off == (key_pos // 16) * 16 else ""
+                                report.write(f"  v18 {hex(off)}: {hex_str}  |{ascii_str}|{marker}\n")
+
+                            pos = found + 1
+                            break  # Only first match per context size
+
+                        if found != -1:
+                            break
+                    else:
+                        report.write("  No context match found in v18\n")
+
+                    # Also search all 32-byte sequences that look like keys (high entropy)
+                    report.write(f"\n  Scanning v18 for potential EC public keys (32-byte high-entropy)...\n")
+                    import hashlib
+                    candidates = []
+                    for i in range(0, len(d18) - 32, 4):
+                        chunk = d18[i:i+32]
+                        # Skip all-zero, all-ff, and low-entropy
+                        if chunk == b'\x00'*32 or chunk == b'\xff'*32:
+                            continue
+                        # Check if it looks like a key (no ASCII, high byte diversity)
+                        unique_bytes = len(set(chunk))
+                        if unique_bytes >= 20:  # High diversity = likely key material
+                            # Check it's not in v17 at the same offset
+                            if i < len(d17) and d17[i:i+32] == chunk:
+                                continue  # Same as v17, skip
+                            candidates.append((i, chunk))
+
+                    report.write(f"  Found {len(candidates)} high-entropy 32-byte candidates unique to v18\n")
+                    for i, (off, chunk) in enumerate(candidates[:20]):
+                        report.write(f"    #{i+1} offset {hex(off)}: {chunk.hex().upper()}\n")
+
+                else:
+                    report.write(f"OLD KEY not found in v17!\n")
+
+        print("Key analysis complete")
+        PYEOF
+      env:
+        VERSION: ${{ github.event.inputs.version }}
+
+    - name: Print analysis report
+      run: |
+        echo "=== MAIN REPORT ==="
+        cat artifacts/analysis/report.txt
+        echo ""
+        echo "=== KEY ANALYSIS ==="
+        cat artifacts/analysis/key_analysis.txt
+
+    - name: Upload v6.49.17 binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: binaries-v6.49.17
+        path: artifacts/v6.49.17/
+
+    - name: Upload v${{ github.event.inputs.version }} binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: binaries-v${{ github.event.inputs.version }}
+        path: artifacts/v${{ github.event.inputs.version }}/
+
+    - name: Upload analysis report
+      uses: actions/upload-artifact@v4
+      with:
+        name: analysis-report
+        path: artifacts/analysis/
