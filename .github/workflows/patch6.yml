@@ -14,7 +14,7 @@ on:
       version:
         description: 'Versi spesifik (contoh: 6.49.17), kosongkan untuk latest'
         required: false
-        default: ''
+        default: '6.49.18'
         type: string
       release:
         description: 'Buat GitHub Release'
