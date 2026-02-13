@@ -1,276 +1,172 @@
 name: Debug Key Search
-
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'RouterOS version to analyze'
+        description: RouterOS version to analyze
         required: true
         default: '6.49.18'
         type: string
-
-env:
-  MIKRO_NPK_SIGN_PUBLIC_KEY: C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59
-  MIKRO_LICENSE_PUBLIC_KEY: 8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32
-  CUSTOM_NPK_SIGN_PRIVATE_KEY: 7D008D9B80B036FB0205601FEE79D550927EBCA937B7008CC877281F2F8AC640
-  CUSTOM_NPK_SIGN_PUBLIC_KEY: 28F886E32C141123126CFBCAD56766E99D1720CEB1F12BE2468BEBE7662FBEDB
-  CUSTOM_LICENSE_PRIVATE_KEY: 9DBC845E9018537810FDAE62824322EEE1B12BAD81FCA28EC295FB397C61CE0B
-  CUSTOM_LICENSE_PUBLIC_KEY: 723A34A6E3300F23E4BAA06156B9327514AEC170732655F16E04C17928DD770F
-
 permissions:
   contents: read
-
 jobs:
   debug:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.x'
-
-    - name: Install dependencies
+    - name: Install deps
       run: |
         sudo apt-get update
-        sudo apt-get install -y mkisofs squashfs-tools --no-install-recommends
+        sudo apt-get install -y squashfs-tools --no-install-recommends
         pip install pefile
-
-    - name: Download and extract ISO
+    - name: Download v6.49.17 and v6.49.18
       run: |
         VERSION="${{ github.event.inputs.version }}"
-        echo "=== Downloading RouterOS $VERSION ==="
-        wget -nv -O mikrotik.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
-        
-        sudo mkdir iso
-        sudo mount -o loop,ro mikrotik.iso iso/
-        ls -la iso/
-        
-        echo ""
-        echo "=== NPK files in ISO ==="
-        ls -la iso/*.npk 2>/dev/null || echo "No NPK files found directly"
-        
-        # Find system NPK
-        SYSTEM_NPK=$(find iso/ -name "system-*.npk" -o -name "routeros-*.npk" | head -1)
-        if [ -z "$SYSTEM_NPK" ]; then
-          echo "No system NPK found, listing all files:"
-          find iso/ -type f
-        else
-          echo "Found system NPK: $SYSTEM_NPK"
-          sudo cp "$SYSTEM_NPK" ./system.npk
-        fi
-        sudo umount iso/
-
-    - name: Extract and analyze system NPK
-      run: |
-        VERSION="${{ github.event.inputs.version }}"
-        OLD_LICENSE_KEY="8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
-        OLD_NPK_SIGN_KEY="C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
-        
-        echo "=== Analyzing system NPK ==="
-        python3 -c "
-import sys
-sys.path.insert(0, '.')
-from npk import NovaPackage, NpkPartID, NpkFileContainer
-npk = NovaPackage.load('system.npk')
-print(f'Package name: {npk[NpkPartID.NAME_INFO].data.name}')
-print(f'Package version: {npk[NpkPartID.NAME_INFO].data.version}')
-
-# Extract squashfs
-squashfs_data = npk[NpkPartID.SQUASHFS].data
-with open('system.sfs', 'wb') as f:
-    f.write(squashfs_data)
-print(f'Squashfs size: {len(squashfs_data)} bytes')
-
-# Extract file container (kernel, initrd, etc)
-fc = NpkFileContainer.unserialize_from(npk[NpkPartID.FILE_CONTAINER].data)
-for item in fc:
-    print(f'  File: {item.name} ({len(item.data)} bytes)')
-    with open(item.name.decode().replace('/', '_'), 'wb') as f:
-        f.write(item.data)
-"
-        
-        echo ""
-        echo "=== Extracting squashfs ==="
-        sudo unsquashfs -d squashfs-root system.sfs
-        
-        echo ""
-        echo "=== Key binaries to check ==="
-        BINARIES="squashfs-root/nova/bin/loader squashfs-root/nova/bin/keyman squashfs-root/nova/bin/fileman squashfs-root/nova/bin/sys2 squashfs-root/nova/bin/installer"
-        for bin in $BINARIES; do
-          if [ -f "$bin" ]; then
-            SIZE=$(stat -c%s "$bin")
-            echo "  $bin ($SIZE bytes)"
-          else
-            echo "  $bin NOT FOUND"
-          fi
-        done
-        
-        echo ""
-        echo "=== Searching for OLD license key (8E1067E4...) ==="
-        OLD_KEY_BYTES=$(echo "$OLD_LICENSE_KEY" | sed 's/\(..\)/\\x\1/g')
-        for bin in $BINARIES; do
-          if [ -f "$bin" ]; then
-            FOUND=$(grep -c -P "\x8E\x10\x67\xE4\x30\x5F\xCD\xC0" "$bin" 2>/dev/null || echo "0")
-            if [ "$FOUND" != "0" ]; then
-              echo "  FOUND in $bin!"
-            else
-              echo "  NOT found in $bin"
-            fi
-          fi
-        done
-        
-        echo ""
-        echo "=== Searching for OLD NPK sign key (C293CED6...) ==="
-        for bin in $BINARIES; do
-          if [ -f "$bin" ]; then
-            FOUND=$(grep -c -P "\xC2\x93\xCE\xD6\x38\xA2\xA3\x3C" "$bin" 2>/dev/null || echo "0")
-            if [ "$FOUND" != "0" ]; then
-              echo "  FOUND in $bin!"
-            else
-              echo "  NOT found in $bin"
-            fi
-          fi
-        done
-
-    - name: Deep binary analysis - find potential new keys
-      run: |
-        echo "=== Analyzing loader binary ==="
-        if [ -f "squashfs-root/nova/bin/loader" ]; then
-          echo "--- Strings containing 'key', 'lic', 'sign', 'cert' ---"
-          strings squashfs-root/nova/bin/loader | grep -i -E "key|lic|sign|cert|public|private" | head -30
-          
-          echo ""
-          echo "--- 32-byte aligned hex patterns (potential EC keys) in loader ---"
-          python3 -c "
-data = open('squashfs-root/nova/bin/loader', 'rb').read()
-
-# Search for 32-byte sequences that look like EC public keys
-# (high entropy, not all zeros or FFs)
-import struct
-
-old_key = bytes.fromhex('8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32')
-print(f'Old key in loader: {old_key in data}')
-
-# Find the old key in v6.49.17 for reference
-# The key is typically near certain function calls
-# Let's search for any 32-byte sequence near known strings
-import re
-
-# Search for references to 'license' or similar
-for match in re.finditer(b'licen', data):
-    offset = match.start()
-    print(f'Found \"licen\" at offset {hex(offset)}')
-    # Show 256 bytes around it
-    start = max(0, offset - 64)
-    end = min(len(data), offset + 192)
-    chunk = data[start:end]
-    # Print hex dump
-    for i in range(0, len(chunk), 32):
-        line = chunk[i:i+32]
-        hex_str = ' '.join(f'{b:02X}' for b in line)
-        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in line)
-        print(f'  {hex(start+i):>10}: {hex_str}  {ascii_str}')
-    print()
-"
-        else
-          echo "loader not found!"
-        fi
-        
-        echo ""
-        echo "=== Analyzing keyman binary ==="
-        if [ -f "squashfs-root/nova/bin/keyman" ]; then
-          echo "--- keyman exists, size: $(stat -c%s squashfs-root/nova/bin/keyman) ---"
-          echo "--- Strings containing 'key', 'lic' ---"
-          strings squashfs-root/nova/bin/keyman | grep -i -E "key|lic|sign|public" | head -30
-          
-          python3 -c "
-data = open('squashfs-root/nova/bin/keyman', 'rb').read()
-old_key = bytes.fromhex('8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32')
-print(f'Old license key in keyman: {old_key in data}')
-"
-        else
-          echo "keyman NOT FOUND in v${{ github.event.inputs.version }}!"
-        fi
-
-    - name: Compare with v6.49.17 reference
-      run: |
-        echo "=== Downloading v6.49.17 for comparison ==="
+        wget -nv -O mikrotik18.iso "https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION.iso"
         wget -nv -O mikrotik17.iso "https://download.mikrotik.com/routeros/6.49.17/mikrotik-6.49.17.iso"
+    - name: Extract and compare
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        
+        echo "=== Extracting v6.49.17 ==="
         sudo mkdir iso17
         sudo mount -o loop,ro mikrotik17.iso iso17/
-        SYSTEM_NPK17=$(find iso17/ -name "system-*.npk" | head -1)
-        sudo cp "$SYSTEM_NPK17" ./system17.npk
+        sudo cp iso17/system-*.npk system17.npk || sudo cp iso17/routeros-*.npk system17.npk
         sudo umount iso17/
         
         python3 -c "
-import sys
-sys.path.insert(0, '.')
-from npk import NovaPackage, NpkPartID, NpkFileContainer
-
-npk17 = NovaPackage.load('system17.npk')
-sfs17 = npk17[NpkPartID.SQUASHFS].data
-with open('system17.sfs', 'wb') as f:
-    f.write(sfs17)
+import sys; sys.path.insert(0,'.')
+from npk import NovaPackage, NpkPartID
+npk = NovaPackage.load('system17.npk')
+with open('sfs17.sfs','wb') as f: f.write(npk[NpkPartID.SQUASHFS].data)
 "
-        sudo unsquashfs -d squashfs17 system17.sfs
+        sudo unsquashfs -d sq17 sfs17.sfs
         
-        echo ""
-        echo "=== Binary comparison ==="
-        BINARIES17="loader keyman fileman sys2 installer"
-        for name in $BINARIES17; do
-          V17="squashfs17/nova/bin/$name"
-          V18="squashfs-root/nova/bin/$name"
-          if [ -f "$V17" ] && [ -f "$V18" ]; then
-            SIZE17=$(stat -c%s "$V17")
-            SIZE18=$(stat -c%s "$V18")
-            echo "$name: v17=$SIZE17 bytes, v18=$SIZE18 bytes"
-          elif [ -f "$V17" ] && [ ! -f "$V18" ]; then
-            echo "$name: EXISTS in v17, MISSING in v18!"
-          elif [ ! -f "$V17" ] && [ -f "$V18" ]; then
-            echo "$name: MISSING in v17, EXISTS in v18!"
-          fi
-        done
+        echo "=== Extracting v$VERSION ==="
+        sudo mkdir iso18
+        sudo mount -o loop,ro mikrotik18.iso iso18/
+        sudo cp iso18/system-*.npk system18.npk || sudo cp iso18/routeros-*.npk system18.npk
+        sudo umount iso18/
         
-        echo ""
-        echo "=== All binaries in v18 squashfs ==="
-        find squashfs-root/nova/bin/ -type f | sort
-        
-        echo ""
-        echo "=== All binaries in v17 squashfs ==="
-        find squashfs17/nova/bin/ -type f | sort
-        
-        echo ""
-        echo "=== Key search in ALL v18 binaries ==="
-        OLD_LICENSE="8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
         python3 -c "
-import os
-old_key = bytes.fromhex('$OLD_LICENSE')
-print(f'Searching for old license key: {old_key[:8].hex().upper()}...')
-for root, dirs, files in os.walk('squashfs-root'):
-    for f in files:
-        fp = os.path.join(root, f)
-        try:
-            data = open(fp, 'rb').read()
-            if old_key in data:
-                print(f'  FOUND in {fp}!')
-            # Also search for partial matches (first 16 bytes)  
-            elif old_key[:16] in data:
-                print(f'  PARTIAL MATCH (16 bytes) in {fp}!')
-        except:
-            pass
-
-print()
-print('Searching in ALL v17 binaries for comparison...')
-for root, dirs, files in os.walk('squashfs17'):
-    for f in files:
-        fp = os.path.join(root, f)
-        try:
-            data = open(fp, 'rb').read()
-            if old_key in data:
-                print(f'  FOUND in {fp}!')
-        except:
-            pass
+import sys; sys.path.insert(0,'.')
+from npk import NovaPackage, NpkPartID
+npk = NovaPackage.load('system18.npk')
+with open('sfs18.sfs','wb') as f: f.write(npk[NpkPartID.SQUASHFS].data)
 "
+        sudo unsquashfs -d sq18 sfs18.sfs
+        
+        echo ""
+        echo "==============================================="
+        echo "=== BINARY FILE LIST COMPARISON ==="
+        echo "==============================================="
+        echo "--- v6.49.17 binaries ---"
+        ls -la sq17/nova/bin/
+        echo ""
+        echo "--- v$VERSION binaries ---"
+        ls -la sq18/nova/bin/
+        
+        echo ""
+        echo "==============================================="
+        echo "=== KEY SEARCH RESULTS ==="
+        echo "==============================================="
+        python3 << 'PYEOF'
+import os
+
+OLD_LICENSE_KEY = bytes.fromhex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
+OLD_NPK_KEY = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
+
+def search_keys(root_dir, label):
+    print(f"\n=== {label} ===")
+    for dirpath, _, files in sorted(os.walk(root_dir)):
+        for fname in sorted(files):
+            fpath = os.path.join(dirpath, fname)
+            try:
+                data = open(fpath, 'rb').read()
+            except:
+                continue
+            relpath = fpath.replace(root_dir, '')
+            has_lic = OLD_LICENSE_KEY in data
+            has_npk = OLD_NPK_KEY in data
+            if has_lic or has_npk:
+                keys = []
+                if has_lic: keys.append("LICENSE_KEY(8E10..)")
+                if has_npk: keys.append("NPK_SIGN_KEY(C293..)")
+                print(f"  {relpath}: {', '.join(keys)}")
+
+search_keys("sq17", "v6.49.17 - Files containing old keys")
+search_keys("sq18", "v${{ github.event.inputs.version }} - Files containing old keys")
+
+print("\n===============================================")
+print("=== MISSING KEY DETAIL ===")
+print("===============================================")
+
+# Compare specific binaries
+for bname in ['loader', 'keyman', 'fileman', 'sys2', 'installer']:
+    p17 = f"sq17/nova/bin/{bname}"
+    p18 = f"sq18/nova/bin/{bname}"
+    
+    if not os.path.exists(p17) and not os.path.exists(p18):
+        continue
+    
+    if os.path.exists(p17) and not os.path.exists(p18):
+        print(f"\n{bname}: EXISTS in v17 but MISSING in v18!")
+        continue
+    
+    if not os.path.exists(p17) and os.path.exists(p18):
+        print(f"\n{bname}: NEW in v18!")
+        continue
+    
+    d17 = open(p17, 'rb').read()
+    d18 = open(p18, 'rb').read()
+    
+    lic17 = OLD_LICENSE_KEY in d17
+    lic18 = OLD_LICENSE_KEY in d18
+    npk17 = OLD_NPK_KEY in d17
+    npk18 = OLD_NPK_KEY in d18
+    
+    print(f"\n{bname}:")
+    print(f"  Size: v17={len(d17)} v18={len(d18)} (diff={len(d18)-len(d17)})")
+    print(f"  LICENSE_KEY:  v17={'YES' if lic17 else 'NO'}  v18={'YES' if lic18 else 'NO'}  {'CHANGED!' if lic17 != lic18 else 'same'}")
+    print(f"  NPK_SIGN_KEY: v17={'YES' if npk17 else 'NO'}  v18={'YES' if npk18 else 'NO'}  {'CHANGED!' if npk17 != npk18 else 'same'}")
+    
+    # If license key is missing in v18, try to find what replaced it
+    if lic17 and not lic18:
+        idx17 = d17.index(OLD_LICENSE_KEY)
+        print(f"  License key was at offset {hex(idx17)} in v17")
+        print(f"  v17 context (64 bytes before key): {d17[max(0,idx17-64):idx17].hex()}")
+        print(f"  v17 key: {d17[idx17:idx17+32].hex()}")
+        
+        # Try to find the same surrounding context in v18
+        ctx_before = d17[max(0,idx17-16):idx17]
+        if ctx_before in d18:
+            new_idx = d18.index(ctx_before) + len(ctx_before)
+            potential_new_key = d18[new_idx:new_idx+32]
+            print(f"  POTENTIAL NEW KEY in v18: {potential_new_key.hex().upper()}")
+            print(f"  v18 context match at offset {hex(new_idx)}")
+        else:
+            print(f"  Context bytes not found in v18 - binary restructured")
+            # Try with shorter context
+            ctx_short = d17[max(0,idx17-8):idx17]
+            if ctx_short in d18:
+                new_idx = d18.index(ctx_short) + len(ctx_short)
+                potential_new_key = d18[new_idx:new_idx+32]
+                print(f"  POTENTIAL NEW KEY (short ctx): {potential_new_key.hex().upper()}")
+
+# Also check initrd
+print("\n=== INITRD CHECK ===")
+for ver, npk_file in [('17', 'system17.npk'), ('18', 'system18.npk')]:
+    import sys; sys.path.insert(0,'.')
+    from npk import NovaPackage, NpkPartID, NpkFileContainer
+    npk = NovaPackage.load(npk_file)
+    fc = NpkFileContainer.unserialize_from(npk[NpkPartID.FILE_CONTAINER].data)
+    for item in fc:
+        has_lic = OLD_LICENSE_KEY in item.data
+        has_npk = OLD_NPK_KEY in item.data
+        print(f"  v{ver} {item.name}: size={len(item.data)} LICENSE={'YES' if has_lic else 'NO'} NPK_SIGN={'YES' if has_npk else 'NO'}")
+PYEOF
